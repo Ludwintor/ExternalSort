@@ -1,130 +1,171 @@
-﻿using System.Text;
+﻿using System.Diagnostics;
 
 namespace ExternalSort
 {
-    public sealed class PolyphaseSort
+    public static class PolyphaseSort
     {
-        private readonly StringBuilder _sb = new();
-        private int _level;
+        private const string TEMP_FILE = ".tape";
 
-        public void Sort<T>(string sourcePath, Func<string, T> selector, string outputPath = "", bool reverse = false, int n = 3) where T : IComparable
+        public static void Sort<T>(string sourcePath, Func<string, T> selector, string outputPath = "", bool reverse = false, int tapesCount = 3) where T : IComparable
         {
-            int[] batches = new int[n];
-            int[] emptyBatches = new int[n];
-            StreamReader source = File.OpenText(sourcePath);
-            DistributeBatches(source, n, batches, emptyBatches);
-            source.Close();
+            Tape[] tapes = new Tape[tapesCount - 1];
+            Comparison<T> comparer = reverse ? (lhs, rhs) => Comparer<T>.Default.Compare(rhs, lhs) : Comparer<T>.Default.Compare;
+            int level = DistributeBatches(sourcePath, tapes);
+            int lastIndex = MergeBatches(tapesCount, level, tapes, selector, comparer);
 
-            Console.WriteLine($"Level = {_level}");
-            Console.WriteLine($"Batches = {string.Join(", ", batches)}");
-            Console.WriteLine($"Empty Batches = {string.Join(", ", emptyBatches)}");
-            Console.WriteLine();
-
-            int lastIndex = MergeBatches(n, batches, emptyBatches, selector);
-
-            Console.WriteLine($"Batches = {string.Join(", ", batches)}");
-            Console.WriteLine($"Empty Batches = {string.Join(", ", emptyBatches)}");
-
+            if (string.IsNullOrEmpty(outputPath))
+                outputPath = sourcePath;
             if (File.Exists(outputPath))
                 File.Delete(outputPath);
-            File.Move($"tape{lastIndex}", outputPath);
+            File.Move($"{TEMP_FILE}{lastIndex}", outputPath);
+
+            Cleanup(tapesCount);
         }
 
-        private int MergeBatches<T>(int tapesCount, int[] batches, int[] emptyBatches, Func<string, T> selector) where T : IComparable
+        private static int DistributeBatches(string sourcePath, Tape[] tapes)
         {
-            StreamReader[] inputs = new StreamReader[tapesCount - 1];
-            int[] batchesLen = new int[tapesCount];
-            int[] batchesLenLeft = new int[tapesCount];
-            string[] firstElements = new string[tapesCount - 1];
-            for (int i = 0; i < inputs.Length; i++)
+            StreamReader source = File.OpenText(sourcePath);
+            for (int i = 0; i < tapes.Length; i++)
             {
-                inputs[i] = File.OpenText($"tape{i}");
-                batchesLen[i] = 1;
+                tapes[i].Writer = File.CreateText($"{TEMP_FILE}{i}");
+                tapes[i].TotalBatches = 1;
+                tapes[i].EmptyBatches = 1;
             }
-            int minTape = tapesCount - 2;
-            while (_level > 0)
+            int level = 1;
+            int current = 0;
+            while (!source.EndOfStream)
             {
-                batches[tapesCount - 1] = 0;
-                emptyBatches[tapesCount - 1] = 0;
-                int batchesToMerge = batches[minTape];
-                StreamWriter output = File.CreateText($"tape{tapesCount - 1}");
+                string? element = source.ReadLine();
+                if (string.IsNullOrEmpty(element))
+                    continue;
+                // Select next tape so that all batches distributed evenly
+                if (current == tapes.Length - 1)
+                    current = 0;
+                else
+                    current = tapes[current].EmptyBatches < tapes[current + 1].EmptyBatches ? current + 1 : 0;
+                if (tapes[current].EmptyBatches == 0)
+                {
+                    // Distribution works that we run out of empty batches only on last tape
+                    // and it means that we run out of all "free space" to insert next batch, so increase level
+                    level++;
+                    ExpandTapes(tapes);
+                    current = 0;
+                }
+                tapes[current].Writer.WriteLine(element);
+                tapes[current].Writer.WriteLine();
+                tapes[current].EmptyBatches--;
+            }
+            source.Close();
+            for (int i = 0; i < tapes.Length; i++)
+                tapes[i].Writer.Close();
+            return level;
+        }
+
+        private static int MergeBatches<T>(int tapesCount, int level, Tape[] tapes, Func<string, T> selector, Comparison<T> comparer) where T : IComparable
+        {
+            for (int i = 0; i < tapes.Length; i++)
+                tapes[i].Reader = File.OpenText($"{TEMP_FILE}{i}");
+            // Last input tape ALWAYS will be with min batches count
+            // (tapesCount - 1 result in index for output tape, but in first while loop iteration it will be last input tape)
+            int minTape = tapesCount - 1;
+            while (level > 0)
+            {
+                // Each phase left tape from current min tape will result in being min for next phase (this is circular)
+                minTape = minTape == 0 ? tapesCount - 2 : minTape - 1;
+                int batchesToMerge = tapes[minTape].TotalBatches;
+                int outputTotalBatches = batchesToMerge;
+                int outputEmptyBatches = 0;
+                StreamWriter output = File.CreateText($"{TEMP_FILE}{tapesCount - 1}");
+                // Merge minimum batches count in output tape
                 while (batchesToMerge > 0)
                 {
+                    // Prepare one batch per tape
                     int realBatches = 0;
-                    for (int i = 0; i < tapesCount - 1; i++)
+                    for (int i = 0; i < tapes.Length; i++)
                     {
-                        batches[i]--;
-                        if (emptyBatches[i] > 0)
+                        tapes[i].TotalBatches--;
+                        if (tapes[i].EmptyBatches > 0)
                         {
-                            emptyBatches[i]--;
+                            tapes[i].EmptyBatches--;
+                            tapes[i].BatchEnd = true;
                         }
                         else
                         {
-                            batchesLenLeft[i] = batchesLen[i];
-                            firstElements[i] = ReadNextElement(inputs[i]);
                             realBatches++;
+                            tapes[i].BatchEnd = false;
+                            // Store first element of each batch to find min between them
+                            tapes[i].CurrentElement = tapes[i].Reader.ReadLine();//ReadNextElement(inputs[i]);
                         }
                     }
-                    batches[tapesCount - 1]++;
+                    // Merge them
+                    // If all batches was empty (dummy) then just go next
                     if (realBatches == 0)
                     {
-                        emptyBatches[tapesCount - 1]++;
+                        outputEmptyBatches++;
                         batchesToMerge--;
                         continue;
                     }
                     
+                    // Find min value among batches' current values and write to output tape
                     while (realBatches > 0)
                     {
-                        int minIndex = FindMin(batchesLenLeft, firstElements, selector);
-                        batchesLenLeft[minIndex]--;
-                        output.Write(firstElements[minIndex]);
-                        output.Write(' ');
-                        if (batchesLenLeft[minIndex] == 0)
+                        int minIndex = FindMin(tapes, selector, comparer);
+                        output.WriteLine(tapes[minIndex].CurrentElement);
+
+                        tapes[minIndex].CurrentElement = tapes[minIndex].Reader.ReadLine();
+                        // Empty string means that we reached end of batch
+                        if (string.IsNullOrEmpty(tapes[minIndex].CurrentElement))
                         {
+                            tapes[minIndex].BatchEnd = true;
                             realBatches--;
                         }
-                        else
-                        {
-                            firstElements[minIndex] = ReadNextElement(inputs[minIndex]);
-                            if (string.IsNullOrEmpty(firstElements[minIndex]))
-                                realBatches--;
-                        }
                     }
-                    output.WriteLine();
+                    // Write batch delimeter if not last phase and merge next
+                    if (level > 1)
+                        output.WriteLine();
                     batchesToMerge--;
                 }
                 output.Close();
-                batches[minTape] = batches[tapesCount - 1];
-                emptyBatches[minTape] = emptyBatches[tapesCount - 1];
-                batchesLen[minTape] = batchesLen.Sum();
-                inputs[minTape].Close();
+                // Now "transfer" all data to empty tape
+                tapes[minTape].TotalBatches = outputTotalBatches;
+                tapes[minTape].EmptyBatches = outputEmptyBatches;
+                tapes[minTape].Reader.Close();
                 output.Close();
-                File.Delete($"tape{minTape}");
-                File.Move($"tape{tapesCount - 1}", $"tape{minTape}");
-                inputs[minTape] = File.OpenText($"tape{minTape}");
-                if (_level > 1)
-                    minTape = minTape == 0 ? tapesCount - 2 : minTape - 1;
-                _level--;
+                // Swap output tape with empty tape
+                File.Delete($"{TEMP_FILE}{minTape}");
+                File.Move($"{TEMP_FILE}{tapesCount - 1}", $"{TEMP_FILE}{minTape}");
+                tapes[minTape].Reader = File.OpenText($"{TEMP_FILE}{minTape}");
+                level--;
             }
 
-            for (int i = 0; i < inputs.Length; i++)
-                inputs[i].Close();
+            for (int i = 0; i < tapes.Length; i++)
+                tapes[i].Reader.Close();
             return minTape;
         }
 
-        private int FindMin<T>(int[] batchesLenLeft, string[] firstElements, Func<string, T> selector) where T : IComparable
+        private static void Cleanup(int tapesCount)
+        {
+            for (int i = 0; i < tapesCount; i++)
+            {
+                string name = $"{TEMP_FILE}{i}";
+                if (File.Exists(name))
+                    File.Delete(name);
+            }
+        }
+
+        private static int FindMin<T>(Tape[] tapes, Func<string, T> selector, Comparison<T> comparer) where T : IComparable
         {
             int minIndex = -1;
             T minValue = default!;
-            for (int i = 0; i < firstElements.Length; i++)
+            for (int i = 0; i < tapes.Length; i++)
             {
-                if (batchesLenLeft[i] == 0)
+                if (tapes[i].BatchEnd)
                     continue;
-                string token = firstElements[i];
+                string? token = tapes[i].CurrentElement;
                 if (string.IsNullOrEmpty(token))
                     continue;
                 T current = selector(token);
-                if (minIndex == -1 || current.CompareTo(minValue) < 0)
+                if (minIndex == -1 || comparer(current, minValue) < 0)
                 {
                     minIndex = i;
                     minValue = current;
@@ -133,69 +174,28 @@ namespace ExternalSort
             return minIndex;
         }
 
-        private void DistributeBatches(StreamReader source, int tapesCount, int[] batches, int[] emptyBatches)
+        private static void ExpandTapes(Tape[] tapes)
         {
-            StreamWriter[] files = new StreamWriter[tapesCount - 1];
-            for (int i = 0; i < tapesCount - 1; i++)
+            int firstBatches = tapes[0].TotalBatches;
+            for (int i = 0; i < tapes.Length - 1; i++)
             {
-                files[i] = File.CreateText($"tape{i}");
-                batches[i] = 1;
-                emptyBatches[i] = 1;
+                tapes[i].EmptyBatches = firstBatches + tapes[i + 1].TotalBatches - tapes[i].TotalBatches;
+                tapes[i].TotalBatches = firstBatches + tapes[i + 1].TotalBatches;
             }
-            _level = 1;
-            int currentTape = 0;
-
-            while (!source.EndOfStream)
-            {
-                // Select next tape so that all batches distributed evenly
-                currentTape = emptyBatches[currentTape] < emptyBatches[currentTape + 1] ? currentTape + 1 : 0;
-                if (emptyBatches[currentTape] == 0)
-                {
-                    // Distribution works that we run out of empty batches only on last tape
-                    // and it means that we run out of all "free space" to insert next batch, so increase level
-                    IncreaseLevel(batches, emptyBatches);
-                    currentTape = 0;
-                }
-                WriteNextElement(source, files[currentTape]);
-                files[currentTape].WriteLine();
-                emptyBatches[currentTape]--;
-            }
-
-            for (int i = 0; i < tapesCount - 1; i++)
-                files[i].Close();
+            tapes[^1].EmptyBatches = firstBatches - tapes[^1].TotalBatches;
+            tapes[^1].TotalBatches = firstBatches;
         }
 
-        private void IncreaseLevel(int[] batches, int[] emptyBatches)
+        private struct Tape
         {
-            _level++;
-            int firstBatches = batches[0];
-            for (int i = 0; i < batches.Length - 1; i++)
-            {
-                emptyBatches[i] = firstBatches + batches[i + 1] - batches[i];
-                batches[i] = firstBatches + batches[i + 1];
-            }
-        }
+            public int TotalBatches = 0;
+            public int EmptyBatches = 0;
+            public string? CurrentElement = null;
+            public bool BatchEnd = false;
+            public StreamReader Reader = null!;
+            public StreamWriter Writer = null!;
 
-        private void WriteNextElement(StreamReader input, StreamWriter output)
-        {
-            output.Write(ReadNextElement(input));
-            output.Write(' ');
-        }
-
-        private string ReadNextElement(StreamReader source)
-        {
-            if (source.EndOfStream)
-                return string.Empty;
-            _sb.Clear();
-            char letter = (char)source.Read();
-            while (letter != ' ')
-            {
-                _sb.Append(letter);
-                if (source.EndOfStream)
-                    break;
-                letter = (char)source.Read();
-            }
-            return _sb.Replace(Environment.NewLine, "").ToString();
+            public Tape() { }
         }
     }
 }
